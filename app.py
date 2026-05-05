@@ -1,5 +1,7 @@
+from utils.data_manipulator import show_manipulate_page
 import streamlit as st
 import pandas as pd
+
 from utils.data_loader import load_file, get_data_summary
 from utils.ollama_chat import (ask_gemma, get_llm_status, find_best_column,
                                 detect_date_column, compute_table)
@@ -8,6 +10,7 @@ from utils.dashboard import auto_detect_kpi_columns, compute_kpis
 from utils.chart_agent import generate_chart
 from utils.history_manager import save_message, load_history, clear_history, get_all_sessions
 from utils.report_generator import generate_excel, generate_pdf
+
 
 st.set_page_config(page_title="Smart Data Analyst", layout="wide")
 
@@ -55,7 +58,7 @@ dataset_name = (uploaded.name if uploaded
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.title("🧠 Smart Data Analyst")
-    page = st.radio("Navigate", ["📊 Dashboard", "💬 Chat"], index=0)
+    page = st.radio("Navigate", ["📊 Dashboard", "💬 Chat", "🛠️ Manipulate"], index=0)
     st.divider()
 
     status = get_llm_status()
@@ -347,6 +350,11 @@ elif page == "💬 Chat":
             save_message(dataset_name, "assistant", answer, query)
             save_qa(active_question, answer, dataset_name)
 
+elif page == "🛠️ Manipulate":
+    if df is None:
+        st.info("⬅️ Pehle sidebar se dataset upload karein.")
+    else:
+        show_manipulate_page(df, dataset_name)
 
 
 
