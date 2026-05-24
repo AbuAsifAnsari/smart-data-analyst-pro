@@ -11,6 +11,7 @@ from utils.chart_agent import generate_chart
 from utils.history_manager import save_message, load_history, clear_history, get_all_sessions
 from utils.report_generator import generate_excel, generate_pdf
 from utils.sql_engine import show_sql_page
+from utils.ml_engine import show_ml_page
 
 
 st.set_page_config(page_title="Smart Data Analyst", layout="wide")
@@ -59,7 +60,7 @@ dataset_name = (uploaded.name if uploaded
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.title("🧠 Smart Data Analyst")
-    page = st.radio("Navigate", ["📊 Dashboard", "💬 Chat", "🛠️ Manipulate", "🗄️ SQL"], index=0)
+    page = st.radio("Navigate", ["📊 Dashboard", "💬 Chat", "🛠️ Manipulate", "🗄️ SQL", "🤖 ML" ], index=0)
     st.divider()
 
     status = get_llm_status()
@@ -363,6 +364,13 @@ elif page == "🗄️ SQL":
         st.info("⬅️ Pehle sidebar se dataset upload karein.")
     else:
         show_sql_page(df, dataset_name)
+
+
+elif page == "🤖 ML":
+    if df is None:
+        st.info("⬅️ Pehle sidebar se dataset upload karein.")
+    else:
+        show_ml_page(df, dataset_name)
 
 
 
