@@ -1,19 +1,21 @@
-# utils/ml_engine.py — V13
+# utils/ml_engine.py — V14
 # Machine Learning Engine
 # Regression, Classification, Clustering, Forecasting
 #
-# V13 CHANGELOG (from V12):
-#   - Hyperparameter controls added for Regression & Classification
-#     (n_estimators, max_depth, learning_rate, alpha, C — shown only
-#     when relevant to the selected model)
-#   - 5-fold cross-validation added for Regression (R²) and
-#     Classification (Accuracy, stratified) so the reported score
-#     isn't dependent on one lucky/unlucky train-test split
-#   - Small-dataset safety: CV fold count auto-shrinks if there
-#     isn't enough data/class balance for 5 folds
+# V14 CHANGELOG (from V13):
+#   - DBSCAN now has tunable eps / min_samples sliders instead of
+#     hardcoded values (fixes the "everything becomes Noise" issue
+#     seen during testing with the Superstore dataset)
+#   - Identifier-like columns (Row ID, Order ID, Postal Code, etc. —
+#     anything with ~as many unique values as rows) are now auto-
+#     detected and excluded from default feature selections across
+#     Regression, Classification, and Clustering, with a note shown
+#     to the user. They can still be manually re-added if wanted.
 #
-# (V12 changes carried over: confusion matrix class names, continuous-
-#  target warning, model export, forecast MAPE, DBSCAN slider hidden)
+# (V13 changes carried over: hyperparameter controls, cross-validation.
+#  V12 changes carried over: confusion matrix class names, continuous-
+#  target warning, model export, forecast MAPE, DBSCAN slider hidden
+#  when not needed.)
 
 import pandas as pd
 import numpy as np
@@ -67,6 +69,25 @@ def _mape(y_true, y_pred):
     return np.mean(np.abs((y_true[mask] - y_pred[mask]) / y_true[mask])) * 100
 
 
+def _detect_identifier_columns(df: pd.DataFrame, threshold: float = 0.95):
+    """V14: Flag columns that look like unique identifiers (Row ID,
+    Order ID, Postal Code, etc.) — i.e. columns whose number of unique
+    values is close to the row count. These are almost never useful
+    as ML features/targets and just add noise or leak row identity."""
+    n = len(df)
+    if n == 0:
+        return []
+    id_cols = []
+    for col in df.columns:
+        try:
+            nunique = df[col].nunique()
+        except TypeError:
+            continue
+        if nunique >= threshold * n and nunique > 1:
+            id_cols.append(col)
+    return id_cols
+
+
 # ══════════════════════════════════════════════════════════════
 #  REGRESSION
 # ══════════════════════════════════════════════════════════════
@@ -110,7 +131,6 @@ def run_regression(df: pd.DataFrame, target: str,
     rmse = np.sqrt(mse)
     r2   = r2_score(y_test, y_pred)
 
-    # V13: 5-fold cross-validation (shrinks automatically on small data)
     cv_result = None
     try:
         cv_folds = min(5, len(X) // 2)
@@ -125,7 +145,6 @@ def run_regression(df: pd.DataFrame, target: str,
     except Exception:
         cv_result = None
 
-    # Feature importance
     if hasattr(model, "feature_importances_"):
         imp = pd.DataFrame({
             "Feature"   : features,
@@ -198,11 +217,8 @@ def run_classification(df: pd.DataFrame, target: str,
     y_pred   = model.predict(X_test_sc)
     accuracy = accuracy_score(y_test, y_pred)
 
-    # Confusion matrix
     cm = confusion_matrix(y_test, y_pred)
 
-    # V13: 5-fold stratified cross-validation with scaling in a pipeline
-    # (scaling done inside the pipeline per-fold to avoid data leakage)
     cv_result = None
     try:
         class_counts = y.value_counts()
@@ -224,7 +240,6 @@ def run_classification(df: pd.DataFrame, target: str,
     except Exception:
         cv_result = None
 
-    # Feature importance
     if hasattr(model, "feature_importances_"):
         imp = pd.DataFrame({
             "Feature"   : features,
@@ -251,7 +266,8 @@ def run_classification(df: pd.DataFrame, target: str,
 # ══════════════════════════════════════════════════════════════
 
 def run_clustering(df: pd.DataFrame, features: list,
-                   n_clusters: int, model_name: str):
+                   n_clusters: int, model_name: str,
+                   eps: float = 0.5, min_samples: int = 5):
     from sklearn.cluster import KMeans, DBSCAN
     from sklearn.preprocessing import StandardScaler
 
@@ -264,8 +280,8 @@ def run_clustering(df: pd.DataFrame, features: list,
     if model_name == "K-Means":
         model  = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
         labels = model.fit_predict(X_scaled)
-    else:  # DBSCAN
-        model  = DBSCAN(eps=0.5, min_samples=5)
+    else:  # DBSCAN — V14: eps/min_samples now configurable from the UI
+        model  = DBSCAN(eps=eps, min_samples=min_samples)
         labels = model.fit_predict(X_scaled)
         n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
 
@@ -273,7 +289,9 @@ def run_clustering(df: pd.DataFrame, features: list,
     df_result["Cluster"] = [f"Cluster {l}" if l >= 0
                              else "Noise" for l in labels]
 
-    # Cluster summary
+    noise_count = int((labels == -1).sum()) if model_name == "DBSCAN" else 0
+    noise_pct   = (noise_count / len(labels) * 100) if len(labels) else 0
+
     summary = df_result.groupby("Cluster")[features].mean().round(2)
 
     return {
@@ -282,6 +300,7 @@ def run_clustering(df: pd.DataFrame, features: list,
         "n_clusters": n_clusters,
         "summary"   : summary,
         "features"  : features,
+        "noise_pct" : noise_pct,
     }
 
 
@@ -326,13 +345,16 @@ def run_forecasting(df: pd.DataFrame, date_col: str,
 # ══════════════════════════════════════════════════════════════
 
 def show_ml_page(df: pd.DataFrame, dataset_name: str):
-    """Main V13 ML page — call from app.py."""
+    """Main V14 ML page — call from app.py."""
     st.header("🤖 Machine Learning")
     st.caption(f"📂 {dataset_name} — {df.shape[0]} rows × {df.shape[1]} cols")
 
     num_cols  = df.select_dtypes(include="number").columns.tolist()
     cat_cols  = df.select_dtypes(include="object").columns.tolist()
     all_cols  = df.columns.tolist()
+
+    # V14: detect identifier-like columns once, reuse everywhere below
+    id_cols = _detect_identifier_columns(df)
 
     # ── ML Type selector ──────────────────────────────────────
     ml_type = st.radio(
@@ -360,7 +382,6 @@ def show_ml_page(df: pd.DataFrame, dataset_name: str):
                  "Random Forest", "Gradient Boosting"],
                 key="reg_model")
 
-        # V13: hyperparameter controls (shown only when relevant)
         hyperparams = {}
         with st.expander("⚙️ Advanced settings (hyperparameters)"):
             if model_name == "Ridge Regression":
@@ -382,11 +403,20 @@ def show_ml_page(df: pd.DataFrame, dataset_name: str):
             else:
                 st.caption("Linear Regression has no tunable hyperparameters.")
 
-        feat_opts = [c for c in all_cols if c != target]
+        # V14: exclude identifier-like columns from default features
+        feat_opts     = [c for c in all_cols if c != target]
+        default_feats = [c for c in feat_opts if c not in id_cols][:4]
         features  = st.multiselect("Feature columns (inputs)",
                                     feat_opts,
-                                    default=feat_opts[:4],
+                                    default=default_feats,
                                     key="reg_feats")
+        excluded_ids = [c for c in id_cols if c in feat_opts and c not in features]
+        if excluded_ids:
+            st.caption(
+                f"ℹ️ Not included by default (look like unique IDs): "
+                f"{', '.join(excluded_ids)}. Add manually above if you "
+                f"really want to use them."
+            )
 
         if st.button("🚀 Train Model", type="primary",
                      use_container_width=True, key="reg_run"):
@@ -397,7 +427,6 @@ def show_ml_page(df: pd.DataFrame, dataset_name: str):
                     res = run_regression(df, target, features, model_name,
                                           hyperparams)
 
-                # Metrics
                 st.subheader("📊 Model Performance")
                 m1, m2 = st.columns(2)
                 m1.metric("R² Score (test split)",
@@ -407,7 +436,6 @@ def show_ml_page(df: pd.DataFrame, dataset_name: str):
                            f"{res['rmse']:,.2f}",
                            help="Lower is better")
 
-                # V13: cross-validation result
                 if res["cv"] is not None:
                     cv = res["cv"]
                     st.metric(
@@ -420,7 +448,6 @@ def show_ml_page(df: pd.DataFrame, dataset_name: str):
                         st.caption("⚠️ High variance across folds — results "
                                    "may be unstable with this data size.")
 
-                # Actual vs Predicted
                 pred_df = pd.DataFrame({
                     "Actual"   : res["y_test"].values,
                     "Predicted": res["y_pred"]
@@ -438,7 +465,6 @@ def show_ml_page(df: pd.DataFrame, dataset_name: str):
                               line=dict(color="#E24B4A", dash="dash"))
                 st.plotly_chart(_style(fig), use_container_width=True)
 
-                # Feature importance
                 if res["importance"] is not None:
                     st.subheader("🎯 Feature Importance")
                     fig2 = px.bar(
@@ -450,7 +476,6 @@ def show_ml_page(df: pd.DataFrame, dataset_name: str):
                     )
                     st.plotly_chart(_style(fig2), use_container_width=True)
 
-                # Insight
                 st.info(
                     f"**Model:** {model_name} | "
                     f"**R²:** {res['r2']:.3f} | "
@@ -458,7 +483,6 @@ def show_ml_page(df: pd.DataFrame, dataset_name: str):
                     f"{'✅ Good fit!' if res['r2'] > 0.7 else '⚠️ Model needs improvement — try more features, different hyperparameters, or a different model.'}"
                 )
 
-                # Model export
                 model_bytes = pickle.dumps(res["model"])
                 st.download_button(
                     "⬇️ Download Trained Model (.pkl)",
@@ -493,7 +517,6 @@ def show_ml_page(df: pd.DataFrame, dataset_name: str):
                 f"with fewer distinct values."
             )
 
-        # V13: hyperparameter controls
         hyperparams = {}
         with st.expander("⚙️ Advanced settings (hyperparameters)"):
             if model_name == "Logistic Regression":
@@ -516,11 +539,20 @@ def show_ml_page(df: pd.DataFrame, dataset_name: str):
                         "Learning rate", 0.01, 0.3, 0.1, step=0.01,
                         key="clf_lr")
 
-        feat_opts = [c for c in num_cols if c != target]
+        # V14: exclude identifier-like columns from default features
+        feat_opts     = [c for c in num_cols if c != target]
+        default_feats = [c for c in feat_opts if c not in id_cols][:4]
         features  = st.multiselect("Feature columns (numeric only)",
                                     feat_opts,
-                                    default=feat_opts[:4],
+                                    default=default_feats,
                                     key="clf_feats")
+        excluded_ids = [c for c in id_cols if c in feat_opts and c not in features]
+        if excluded_ids:
+            st.caption(
+                f"ℹ️ Not included by default (look like unique IDs): "
+                f"{', '.join(excluded_ids)}. Add manually above if you "
+                f"really want to use them."
+            )
 
         if st.button("🚀 Train Model", type="primary",
                      use_container_width=True, key="clf_run"):
@@ -531,14 +563,12 @@ def show_ml_page(df: pd.DataFrame, dataset_name: str):
                     res = run_classification(df, target, features, model_name,
                                               hyperparams)
 
-                # Accuracy
                 st.subheader("📊 Model Performance")
                 m1, m2 = st.columns(2)
                 m1.metric("Accuracy (test split)",
                            f"{res['accuracy']*100:.2f}%",
                            help="Percentage of correct predictions")
 
-                # V13: cross-validation result
                 if res["cv"] is not None:
                     cv = res["cv"]
                     m2.metric(
@@ -554,7 +584,6 @@ def show_ml_page(df: pd.DataFrame, dataset_name: str):
                     st.caption("Cross-validation skipped — not enough data "
                                "or class examples for reliable folds.")
 
-                # Confusion matrix
                 if res["encoder"] is not None:
                     class_names = list(res["encoder"].classes_)
                 else:
@@ -574,7 +603,6 @@ def show_ml_page(df: pd.DataFrame, dataset_name: str):
                 )
                 st.plotly_chart(_style(fig), use_container_width=True)
 
-                # Feature importance
                 if res["importance"] is not None:
                     st.subheader("🎯 Feature Importance")
                     fig2 = px.bar(
@@ -586,7 +614,6 @@ def show_ml_page(df: pd.DataFrame, dataset_name: str):
                     )
                     st.plotly_chart(_style(fig2), use_container_width=True)
 
-                # Insight
                 acc = res["accuracy"]
                 st.info(
                     f"**Model:** {model_name} | "
@@ -594,7 +621,6 @@ def show_ml_page(df: pd.DataFrame, dataset_name: str):
                     f"{'✅ Excellent accuracy!' if acc > 0.85 else '✅ Good accuracy!' if acc > 0.7 else '⚠️ Try different hyperparameters, Random Forest, or more features.'}"
                 )
 
-                # Model export
                 model_bytes = pickle.dumps(res["model"])
                 st.download_button(
                     "⬇️ Download Trained Model (.pkl)",
@@ -619,14 +645,46 @@ def show_ml_page(df: pd.DataFrame, dataset_name: str):
             if model_name == "K-Means":
                 n_clusters = st.slider("Number of clusters", 2, 8, 3,
                                         key="clust_n")
+                eps, min_samples = 0.5, 5  # unused for K-Means
             else:
-                n_clusters = 3
+                n_clusters = 3  # unused, DBSCAN infers cluster count itself
                 st.caption("DBSCAN finds the number of clusters automatically.")
 
+        # V14: DBSCAN tuning controls (shown only when DBSCAN is selected)
+        if model_name == "DBSCAN":
+            c1, c2 = st.columns(2)
+            with c1:
+                eps = st.slider(
+                    "eps (neighborhood distance)", 0.1, 3.0, 0.5, step=0.05,
+                    key="clust_eps",
+                    help="Smaller = stricter grouping (more 'Noise'). "
+                         "Larger = looser grouping (fewer, bigger clusters)."
+                )
+            with c2:
+                min_samples = st.slider(
+                    "min_samples (min points per cluster)", 2, 20, 5,
+                    key="clust_min_samples",
+                    help="Minimum number of nearby points needed to form "
+                         "a cluster. Lower = easier to form small clusters."
+                )
+            st.caption(
+                "💡 If most points show up as 'Noise' after running, "
+                "try increasing eps first."
+            )
+
+        # V14: exclude identifier-like columns from default features
+        default_feats = [c for c in num_cols if c not in id_cols][:3]
         features = st.multiselect("Feature columns",
                                    num_cols,
-                                   default=num_cols[:3],
+                                   default=default_feats,
                                    key="clust_feats")
+        excluded_ids = [c for c in id_cols if c in num_cols and c not in features]
+        if excluded_ids:
+            st.caption(
+                f"ℹ️ Not included by default (look like unique IDs): "
+                f"{', '.join(excluded_ids)}. Add manually above if you "
+                f"really want to use them."
+            )
 
         if st.button("🚀 Run Clustering", type="primary",
                      use_container_width=True, key="clust_run"):
@@ -634,9 +692,17 @@ def show_ml_page(df: pd.DataFrame, dataset_name: str):
                 st.warning("Please select at least 2 feature columns.")
             else:
                 with st.spinner("Finding clusters..."):
-                    res = run_clustering(df, features, n_clusters, model_name)
+                    res = run_clustering(df, features, n_clusters, model_name,
+                                          eps=eps, min_samples=min_samples)
 
                 st.success(f"Found {res['n_clusters']} clusters!")
+
+                if model_name == "DBSCAN" and res["noise_pct"] > 40:
+                    st.warning(
+                        f"⚠️ {res['noise_pct']:.0f}% of points were classified "
+                        f"as 'Noise' (not part of any cluster). Try increasing "
+                        f"eps or lowering min_samples above and run again."
+                    )
 
                 fig = px.scatter(
                     res["df_result"],
