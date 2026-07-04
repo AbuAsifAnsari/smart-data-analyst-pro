@@ -1,17 +1,19 @@
-# utils/ml_engine.py — V12
+# utils/ml_engine.py — V13
 # Machine Learning Engine
 # Regression, Classification, Clustering, Forecasting
 #
-# V12 CHANGELOG (from V11):
-#   - Confusion matrix now shows actual class names instead of 0/1/2
-#   - Warning added when a continuous numeric column is picked as a
-#     classification target (likely user error -> should use Regression)
-#   - Trained model can now be downloaded (pickle) after Regression/
-#     Classification runs
-#   - Forecasting now reports in-sample MAPE / accuracy so results
-#     aren't shown blind
-#   - DBSCAN cluster slider is hidden (not just disabled) since it
-#     doesn't apply, to avoid misleading UI
+# V13 CHANGELOG (from V12):
+#   - Hyperparameter controls added for Regression & Classification
+#     (n_estimators, max_depth, learning_rate, alpha, C — shown only
+#     when relevant to the selected model)
+#   - 5-fold cross-validation added for Regression (R²) and
+#     Classification (Accuracy, stratified) so the reported score
+#     isn't dependent on one lucky/unlucky train-test split
+#   - Small-dataset safety: CV fold count auto-shrinks if there
+#     isn't enough data/class balance for 5 folds
+#
+# (V12 changes carried over: confusion matrix class names, continuous-
+#  target warning, model export, forecast MAPE, DBSCAN slider hidden)
 
 import pandas as pd
 import numpy as np
@@ -19,7 +21,9 @@ import pickle
 import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import (train_test_split, cross_val_score,
+                                      StratifiedKFold, KFold)
+from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.metrics import (mean_squared_error, r2_score,
                               accuracy_score, classification_report,
@@ -68,9 +72,12 @@ def _mape(y_true, y_pred):
 # ══════════════════════════════════════════════════════════════
 
 def run_regression(df: pd.DataFrame, target: str,
-                   features: list, model_name: str):
+                   features: list, model_name: str,
+                   hyperparams: dict = None):
     from sklearn.linear_model import LinearRegression, Ridge
     from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+
+    hyperparams = hyperparams or {}
 
     df_clean = df[features + [target]].dropna()
     df_enc, _ = _encode_df(df_clean)
@@ -82,12 +89,18 @@ def run_regression(df: pd.DataFrame, target: str,
         X, y, test_size=0.2, random_state=42)
 
     models = {
-        "Linear Regression"       : LinearRegression(),
-        "Ridge Regression"        : Ridge(alpha=1.0),
-        "Random Forest"           : RandomForestRegressor(
-                                     n_estimators=100, random_state=42),
-        "Gradient Boosting"       : GradientBoostingRegressor(
-                                     n_estimators=100, random_state=42),
+        "Linear Regression": LinearRegression(),
+        "Ridge Regression": Ridge(
+            alpha=hyperparams.get("alpha", 1.0)),
+        "Random Forest": RandomForestRegressor(
+            n_estimators=hyperparams.get("n_estimators", 100),
+            max_depth=hyperparams.get("max_depth", None),
+            random_state=42),
+        "Gradient Boosting": GradientBoostingRegressor(
+            n_estimators=hyperparams.get("n_estimators", 100),
+            max_depth=hyperparams.get("max_depth", 3),
+            learning_rate=hyperparams.get("learning_rate", 0.1),
+            random_state=42),
     }
     model = models[model_name]
     model.fit(X_train, y_train)
@@ -96,6 +109,21 @@ def run_regression(df: pd.DataFrame, target: str,
     mse  = mean_squared_error(y_test, y_pred)
     rmse = np.sqrt(mse)
     r2   = r2_score(y_test, y_pred)
+
+    # V13: 5-fold cross-validation (shrinks automatically on small data)
+    cv_result = None
+    try:
+        cv_folds = min(5, len(X) // 2)
+        if cv_folds >= 2:
+            cv_scores = cross_val_score(
+                models[model_name], X, y, cv=cv_folds, scoring="r2")
+            cv_result = {
+                "mean": cv_scores.mean(),
+                "std": cv_scores.std(),
+                "folds": cv_folds,
+            }
+    except Exception:
+        cv_result = None
 
     # Feature importance
     if hasattr(model, "feature_importances_"):
@@ -118,6 +146,7 @@ def run_regression(df: pd.DataFrame, target: str,
         "rmse"     : rmse,
         "r2"       : r2,
         "importance": imp,
+        "cv"       : cv_result,
     }
 
 
@@ -126,10 +155,13 @@ def run_regression(df: pd.DataFrame, target: str,
 # ══════════════════════════════════════════════════════════════
 
 def run_classification(df: pd.DataFrame, target: str,
-                       features: list, model_name: str):
+                       features: list, model_name: str,
+                       hyperparams: dict = None):
     from sklearn.linear_model import LogisticRegression
     from sklearn.tree import DecisionTreeClassifier
     from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+
+    hyperparams = hyperparams or {}
 
     df_clean = df[features + [target]].dropna()
     df_enc, encoders = _encode_df(df_clean)
@@ -140,25 +172,57 @@ def run_classification(df: pd.DataFrame, target: str,
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=0.2, random_state=42)
 
-    scaler  = StandardScaler()
-    X_train = scaler.fit_transform(X_train)
-    X_test  = scaler.transform(X_test)
+    scaler       = StandardScaler()
+    X_train_sc   = scaler.fit_transform(X_train)
+    X_test_sc    = scaler.transform(X_test)
 
     models = {
-        "Logistic Regression" : LogisticRegression(max_iter=500, random_state=42),
-        "Decision Tree"       : DecisionTreeClassifier(max_depth=5, random_state=42),
-        "Random Forest"       : RandomForestClassifier(
-                                 n_estimators=100, random_state=42),
-        "Gradient Boosting"   : GradientBoostingClassifier(
-                                 n_estimators=100, random_state=42),
+        "Logistic Regression": LogisticRegression(
+            C=hyperparams.get("C", 1.0),
+            max_iter=500, random_state=42),
+        "Decision Tree": DecisionTreeClassifier(
+            max_depth=hyperparams.get("max_depth", 5),
+            random_state=42),
+        "Random Forest": RandomForestClassifier(
+            n_estimators=hyperparams.get("n_estimators", 100),
+            max_depth=hyperparams.get("max_depth", None),
+            random_state=42),
+        "Gradient Boosting": GradientBoostingClassifier(
+            n_estimators=hyperparams.get("n_estimators", 100),
+            max_depth=hyperparams.get("max_depth", 3),
+            learning_rate=hyperparams.get("learning_rate", 0.1),
+            random_state=42),
     }
     model = models[model_name]
-    model.fit(X_train, y_train)
-    y_pred   = model.predict(X_test)
+    model.fit(X_train_sc, y_train)
+    y_pred   = model.predict(X_test_sc)
     accuracy = accuracy_score(y_test, y_pred)
 
     # Confusion matrix
     cm = confusion_matrix(y_test, y_pred)
+
+    # V13: 5-fold stratified cross-validation with scaling in a pipeline
+    # (scaling done inside the pipeline per-fold to avoid data leakage)
+    cv_result = None
+    try:
+        class_counts = y.value_counts()
+        cv_folds = min(5, class_counts.min(), len(X) // 2)
+        if cv_folds >= 2:
+            pipe = Pipeline([
+                ("scaler", StandardScaler()),
+                ("model", models[model_name]),
+            ])
+            skf = StratifiedKFold(n_splits=cv_folds, shuffle=True,
+                                   random_state=42)
+            cv_scores = cross_val_score(pipe, X, y, cv=skf,
+                                         scoring="accuracy")
+            cv_result = {
+                "mean": cv_scores.mean(),
+                "std": cv_scores.std(),
+                "folds": cv_folds,
+            }
+    except Exception:
+        cv_result = None
 
     # Feature importance
     if hasattr(model, "feature_importances_"):
@@ -171,12 +235,14 @@ def run_classification(df: pd.DataFrame, target: str,
 
     return {
         "model"    : model,
+        "scaler"   : scaler,
         "accuracy" : accuracy,
         "y_test"   : y_test,
         "y_pred"   : y_pred,
         "cm"       : cm,
         "importance": imp,
         "encoder"  : encoders.get(target),
+        "cv"       : cv_result,
     }
 
 
@@ -245,8 +311,6 @@ def run_forecasting(df: pd.DataFrame, date_col: str,
         future   = model.make_future_dataframe(periods=periods, freq="ME")
         forecast = model.predict(future)
 
-        # In-sample accuracy check (V12): compare model's fitted values
-        # against the historical actuals it was trained on.
         in_sample = forecast[forecast["ds"].isin(df_prophet["ds"])] \
                     .merge(df_prophet, on="ds", how="inner")
         mape = _mape(in_sample["y"], in_sample["yhat"])
@@ -262,7 +326,7 @@ def run_forecasting(df: pd.DataFrame, date_col: str,
 # ══════════════════════════════════════════════════════════════
 
 def show_ml_page(df: pd.DataFrame, dataset_name: str):
-    """Main V12 ML page — call from app.py."""
+    """Main V13 ML page — call from app.py."""
     st.header("🤖 Machine Learning")
     st.caption(f"📂 {dataset_name} — {df.shape[0]} rows × {df.shape[1]} cols")
 
@@ -296,6 +360,28 @@ def show_ml_page(df: pd.DataFrame, dataset_name: str):
                  "Random Forest", "Gradient Boosting"],
                 key="reg_model")
 
+        # V13: hyperparameter controls (shown only when relevant)
+        hyperparams = {}
+        with st.expander("⚙️ Advanced settings (hyperparameters)"):
+            if model_name == "Ridge Regression":
+                hyperparams["alpha"] = st.slider(
+                    "Alpha (regularization strength)", 0.01, 10.0, 1.0,
+                    key="reg_alpha")
+            elif model_name in ("Random Forest", "Gradient Boosting"):
+                hyperparams["n_estimators"] = st.slider(
+                    "Number of trees (n_estimators)", 50, 300, 100, step=10,
+                    key="reg_n_est")
+                hyperparams["max_depth"] = st.slider(
+                    "Max tree depth", 2, 20,
+                    5 if model_name == "Gradient Boosting" else 10,
+                    key="reg_depth")
+                if model_name == "Gradient Boosting":
+                    hyperparams["learning_rate"] = st.slider(
+                        "Learning rate", 0.01, 0.3, 0.1, step=0.01,
+                        key="reg_lr")
+            else:
+                st.caption("Linear Regression has no tunable hyperparameters.")
+
         feat_opts = [c for c in all_cols if c != target]
         features  = st.multiselect("Feature columns (inputs)",
                                     feat_opts,
@@ -308,17 +394,31 @@ def show_ml_page(df: pd.DataFrame, dataset_name: str):
                 st.warning("Please select at least one feature column.")
             else:
                 with st.spinner("Training model..."):
-                    res = run_regression(df, target, features, model_name)
+                    res = run_regression(df, target, features, model_name,
+                                          hyperparams)
 
                 # Metrics
                 st.subheader("📊 Model Performance")
                 m1, m2 = st.columns(2)
-                m1.metric("R² Score",
+                m1.metric("R² Score (test split)",
                            f"{res['r2']:.4f}",
                            help="1.0 = perfect, 0 = no predictive power")
                 m2.metric("RMSE",
                            f"{res['rmse']:,.2f}",
                            help="Lower is better")
+
+                # V13: cross-validation result
+                if res["cv"] is not None:
+                    cv = res["cv"]
+                    st.metric(
+                        f"Cross-Validated R² ({cv['folds']}-fold)",
+                        f"{cv['mean']:.4f} ± {cv['std']:.4f}",
+                        help="Average R² across multiple train/test splits — "
+                             "more reliable than a single split."
+                    )
+                    if cv["std"] > 0.15:
+                        st.caption("⚠️ High variance across folds — results "
+                                   "may be unstable with this data size.")
 
                 # Actual vs Predicted
                 pred_df = pd.DataFrame({
@@ -355,10 +455,10 @@ def show_ml_page(df: pd.DataFrame, dataset_name: str):
                     f"**Model:** {model_name} | "
                     f"**R²:** {res['r2']:.3f} | "
                     f"**RMSE:** {res['rmse']:,.2f}\n\n"
-                    f"{'✅ Good fit!' if res['r2'] > 0.7 else '⚠️ Model needs improvement — try more features or different model.'}"
+                    f"{'✅ Good fit!' if res['r2'] > 0.7 else '⚠️ Model needs improvement — try more features, different hyperparameters, or a different model.'}"
                 )
 
-                # V12: model export
+                # Model export
                 model_bytes = pickle.dumps(res["model"])
                 st.download_button(
                     "⬇️ Download Trained Model (.pkl)",
@@ -384,7 +484,6 @@ def show_ml_page(df: pd.DataFrame, dataset_name: str):
                  "Random Forest", "Gradient Boosting"],
                 key="clf_model")
 
-        # V12: warn if a continuous numeric column is picked as target
         if target in num_cols and df[target].nunique() > 15:
             st.warning(
                 f"⚠️ '{target}' looks like a continuous variable "
@@ -393,6 +492,29 @@ def show_ml_page(df: pd.DataFrame, dataset_name: str):
                 f"consider using **Regression** instead, or pick a column "
                 f"with fewer distinct values."
             )
+
+        # V13: hyperparameter controls
+        hyperparams = {}
+        with st.expander("⚙️ Advanced settings (hyperparameters)"):
+            if model_name == "Logistic Regression":
+                hyperparams["C"] = st.slider(
+                    "C (inverse regularization strength)", 0.01, 10.0, 1.0,
+                    key="clf_c")
+            elif model_name == "Decision Tree":
+                hyperparams["max_depth"] = st.slider(
+                    "Max tree depth", 2, 20, 5, key="clf_depth_dt")
+            elif model_name in ("Random Forest", "Gradient Boosting"):
+                hyperparams["n_estimators"] = st.slider(
+                    "Number of trees (n_estimators)", 50, 300, 100, step=10,
+                    key="clf_n_est")
+                hyperparams["max_depth"] = st.slider(
+                    "Max tree depth", 2, 20,
+                    5 if model_name == "Gradient Boosting" else 10,
+                    key="clf_depth")
+                if model_name == "Gradient Boosting":
+                    hyperparams["learning_rate"] = st.slider(
+                        "Learning rate", 0.01, 0.3, 0.1, step=0.01,
+                        key="clf_lr")
 
         feat_opts = [c for c in num_cols if c != target]
         features  = st.multiselect("Feature columns (numeric only)",
@@ -406,15 +528,33 @@ def show_ml_page(df: pd.DataFrame, dataset_name: str):
                 st.warning("Please select at least one numeric feature.")
             else:
                 with st.spinner("Training model..."):
-                    res = run_classification(df, target, features, model_name)
+                    res = run_classification(df, target, features, model_name,
+                                              hyperparams)
 
                 # Accuracy
                 st.subheader("📊 Model Performance")
-                st.metric("Accuracy",
+                m1, m2 = st.columns(2)
+                m1.metric("Accuracy (test split)",
                            f"{res['accuracy']*100:.2f}%",
                            help="Percentage of correct predictions")
 
-                # Confusion matrix (V12: real class names instead of 0/1/2)
+                # V13: cross-validation result
+                if res["cv"] is not None:
+                    cv = res["cv"]
+                    m2.metric(
+                        f"Cross-Validated Accuracy ({cv['folds']}-fold)",
+                        f"{cv['mean']*100:.2f}% ± {cv['std']*100:.2f}%",
+                        help="Average accuracy across multiple train/test "
+                             "splits — more reliable than a single split."
+                    )
+                    if cv["std"] > 0.1:
+                        st.caption("⚠️ High variance across folds — results "
+                                   "may be unstable with this data size.")
+                else:
+                    st.caption("Cross-validation skipped — not enough data "
+                               "or class examples for reliable folds.")
+
+                # Confusion matrix
                 if res["encoder"] is not None:
                     class_names = list(res["encoder"].classes_)
                 else:
@@ -451,10 +591,10 @@ def show_ml_page(df: pd.DataFrame, dataset_name: str):
                 st.info(
                     f"**Model:** {model_name} | "
                     f"**Accuracy:** {acc*100:.2f}%\n\n"
-                    f"{'✅ Excellent accuracy!' if acc > 0.85 else '✅ Good accuracy!' if acc > 0.7 else '⚠️ Try Random Forest or more features.'}"
+                    f"{'✅ Excellent accuracy!' if acc > 0.85 else '✅ Good accuracy!' if acc > 0.7 else '⚠️ Try different hyperparameters, Random Forest, or more features.'}"
                 )
 
-                # V12: model export
+                # Model export
                 model_bytes = pickle.dumps(res["model"])
                 st.download_button(
                     "⬇️ Download Trained Model (.pkl)",
@@ -476,13 +616,11 @@ def show_ml_page(df: pd.DataFrame, dataset_name: str):
                                        ["K-Means", "DBSCAN"],
                                        key="clust_model")
         with col2:
-            # V12: slider is hidden (not just disabled) for DBSCAN,
-            # since cluster count isn't a DBSCAN parameter at all.
             if model_name == "K-Means":
                 n_clusters = st.slider("Number of clusters", 2, 8, 3,
                                         key="clust_n")
             else:
-                n_clusters = 3  # unused, DBSCAN infers cluster count itself
+                n_clusters = 3
                 st.caption("DBSCAN finds the number of clusters automatically.")
 
         features = st.multiselect("Feature columns",
@@ -500,7 +638,6 @@ def show_ml_page(df: pd.DataFrame, dataset_name: str):
 
                 st.success(f"Found {res['n_clusters']} clusters!")
 
-                # Scatter plot (first 2 features)
                 fig = px.scatter(
                     res["df_result"],
                     x=features[0],
@@ -511,11 +648,9 @@ def show_ml_page(df: pd.DataFrame, dataset_name: str):
                 )
                 st.plotly_chart(_style(fig), use_container_width=True)
 
-                # Cluster summary
                 st.subheader("📊 Cluster Summary")
                 st.dataframe(res["summary"], use_container_width=True)
 
-                # Download
                 csv = res["df_result"].to_csv(index=False).encode("utf-8")
                 st.download_button(
                     "⬇️ Download Clustered Data",
@@ -569,7 +704,6 @@ def show_ml_page(df: pd.DataFrame, dataset_name: str):
                 df_hist  = res["df_prophet"]
                 mape     = res.get("mape")
 
-                # Plot
                 fig = go.Figure()
                 fig.add_trace(go.Scatter(
                     x=df_hist["ds"], y=df_hist["y"],
@@ -601,7 +735,6 @@ def show_ml_page(df: pd.DataFrame, dataset_name: str):
                 )
                 st.plotly_chart(fig, use_container_width=True)
 
-                # V12: accuracy metric shown before the table
                 if mape is not None:
                     acc_label = ("✅ High confidence" if mape < 10 else
                                  "✅ Reasonable confidence" if mape < 20 else
@@ -611,7 +744,6 @@ def show_ml_page(df: pd.DataFrame, dataset_name: str):
                                     "already saw. Lower is better.")
                     st.caption(acc_label)
 
-                # Forecast table
                 st.subheader("📋 Forecast Values")
                 fc_table = forecast[["ds","yhat","yhat_lower","yhat_upper"]]\
                            .tail(periods).copy()
@@ -620,7 +752,6 @@ def show_ml_page(df: pd.DataFrame, dataset_name: str):
                 fc_table = fc_table.round(2)
                 st.dataframe(fc_table, use_container_width=True, hide_index=True)
 
-                # Download
                 csv = fc_table.to_csv(index=False).encode("utf-8")
                 st.download_button(
                     "⬇️ Download Forecast",
