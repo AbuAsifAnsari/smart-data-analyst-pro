@@ -1,9 +1,21 @@
-# utils/ml_engine.py — V11
+# utils/ml_engine.py — V12
 # Machine Learning Engine
 # Regression, Classification, Clustering, Forecasting
+#
+# V12 CHANGELOG (from V11):
+#   - Confusion matrix now shows actual class names instead of 0/1/2
+#   - Warning added when a continuous numeric column is picked as a
+#     classification target (likely user error -> should use Regression)
+#   - Trained model can now be downloaded (pickle) after Regression/
+#     Classification runs
+#   - Forecasting now reports in-sample MAPE / accuracy so results
+#     aren't shown blind
+#   - DBSCAN cluster slider is hidden (not just disabled) since it
+#     doesn't apply, to avoid misleading UI
 
 import pandas as pd
 import numpy as np
+import pickle
 import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
@@ -40,6 +52,15 @@ def _encode_df(df: pd.DataFrame):
         df_enc[col] = le.fit_transform(df_enc[col].astype(str))
         encoders[col] = le
     return df_enc, encoders
+
+
+def _mape(y_true, y_pred):
+    """Mean Absolute Percentage Error, safe against zero values."""
+    y_true, y_pred = np.array(y_true), np.array(y_pred)
+    mask = y_true != 0
+    if mask.sum() == 0:
+        return None
+    return np.mean(np.abs((y_true[mask] - y_pred[mask]) / y_true[mask])) * 100
 
 
 # ══════════════════════════════════════════════════════════════
@@ -224,8 +245,14 @@ def run_forecasting(df: pd.DataFrame, date_col: str,
         future   = model.make_future_dataframe(periods=periods, freq="ME")
         forecast = model.predict(future)
 
+        # In-sample accuracy check (V12): compare model's fitted values
+        # against the historical actuals it was trained on.
+        in_sample = forecast[forecast["ds"].isin(df_prophet["ds"])] \
+                    .merge(df_prophet, on="ds", how="inner")
+        mape = _mape(in_sample["y"], in_sample["yhat"])
+
         return {"model": model, "forecast": forecast,
-                "df_prophet": df_prophet}, None
+                "df_prophet": df_prophet, "mape": mape}, None
     except Exception as e:
         return None, str(e)
 
@@ -235,7 +262,7 @@ def run_forecasting(df: pd.DataFrame, date_col: str,
 # ══════════════════════════════════════════════════════════════
 
 def show_ml_page(df: pd.DataFrame, dataset_name: str):
-    """Main V11 ML page — call from app.py."""
+    """Main V12 ML page — call from app.py."""
     st.header("🤖 Machine Learning")
     st.caption(f"📂 {dataset_name} — {df.shape[0]} rows × {df.shape[1]} cols")
 
@@ -331,6 +358,15 @@ def show_ml_page(df: pd.DataFrame, dataset_name: str):
                     f"{'✅ Good fit!' if res['r2'] > 0.7 else '⚠️ Model needs improvement — try more features or different model.'}"
                 )
 
+                # V12: model export
+                model_bytes = pickle.dumps(res["model"])
+                st.download_button(
+                    "⬇️ Download Trained Model (.pkl)",
+                    data=model_bytes,
+                    file_name=f"regression_{model_name.replace(' ', '_').lower()}.pkl",
+                    mime="application/octet-stream"
+                )
+
     # ══════════════════════════════════════════════════════════
     # CLASSIFICATION
     # ══════════════════════════════════════════════════════════
@@ -347,6 +383,16 @@ def show_ml_page(df: pd.DataFrame, dataset_name: str):
                 ["Logistic Regression", "Decision Tree",
                  "Random Forest", "Gradient Boosting"],
                 key="clf_model")
+
+        # V12: warn if a continuous numeric column is picked as target
+        if target in num_cols and df[target].nunique() > 15:
+            st.warning(
+                f"⚠️ '{target}' looks like a continuous variable "
+                f"({df[target].nunique()} unique values) rather than a "
+                f"category. Classification may give meaningless results — "
+                f"consider using **Regression** instead, or pick a column "
+                f"with fewer distinct values."
+            )
 
         feat_opts = [c for c in num_cols if c != target]
         features  = st.multiselect("Feature columns (numeric only)",
@@ -368,13 +414,23 @@ def show_ml_page(df: pd.DataFrame, dataset_name: str):
                            f"{res['accuracy']*100:.2f}%",
                            help="Percentage of correct predictions")
 
-                # Confusion matrix
-                cm_df = pd.DataFrame(res["cm"])
+                # Confusion matrix (V12: real class names instead of 0/1/2)
+                if res["encoder"] is not None:
+                    class_names = list(res["encoder"].classes_)
+                else:
+                    class_names = [str(c) for c in sorted(pd.unique(
+                        pd.concat([res["y_test"], pd.Series(res["y_pred"])])
+                    ))]
+
+                cm_df = pd.DataFrame(res["cm"],
+                                      index=class_names,
+                                      columns=class_names)
                 fig   = px.imshow(
                     cm_df,
                     title="Confusion Matrix",
                     color_continuous_scale="Blues",
-                    text_auto=True
+                    text_auto=True,
+                    labels=dict(x="Predicted", y="Actual")
                 )
                 st.plotly_chart(_style(fig), use_container_width=True)
 
@@ -398,6 +454,15 @@ def show_ml_page(df: pd.DataFrame, dataset_name: str):
                     f"{'✅ Excellent accuracy!' if acc > 0.85 else '✅ Good accuracy!' if acc > 0.7 else '⚠️ Try Random Forest or more features.'}"
                 )
 
+                # V12: model export
+                model_bytes = pickle.dumps(res["model"])
+                st.download_button(
+                    "⬇️ Download Trained Model (.pkl)",
+                    data=model_bytes,
+                    file_name=f"classification_{model_name.replace(' ', '_').lower()}.pkl",
+                    mime="application/octet-stream"
+                )
+
     # ══════════════════════════════════════════════════════════
     # CLUSTERING
     # ══════════════════════════════════════════════════════════
@@ -405,17 +470,20 @@ def show_ml_page(df: pd.DataFrame, dataset_name: str):
         st.subheader("🔵 Clustering — Find Groups in Data")
         st.caption("e.g. Customer segmentation, product grouping")
 
-        col1, col2, col3 = st.columns(3)
+        col1, col2 = st.columns(2)
         with col1:
             model_name = st.selectbox("Algorithm",
                                        ["K-Means", "DBSCAN"],
                                        key="clust_model")
         with col2:
-            n_clusters = st.slider("Number of clusters", 2, 8, 3,
-                                    key="clust_n",
-                                    disabled=(model_name == "DBSCAN"))
-        with col3:
-            st.write("")  # spacer
+            # V12: slider is hidden (not just disabled) for DBSCAN,
+            # since cluster count isn't a DBSCAN parameter at all.
+            if model_name == "K-Means":
+                n_clusters = st.slider("Number of clusters", 2, 8, 3,
+                                        key="clust_n")
+            else:
+                n_clusters = 3  # unused, DBSCAN infers cluster count itself
+                st.caption("DBSCAN finds the number of clusters automatically.")
 
         features = st.multiselect("Feature columns",
                                    num_cols,
@@ -499,6 +567,7 @@ def show_ml_page(df: pd.DataFrame, dataset_name: str):
             else:
                 forecast = res["forecast"]
                 df_hist  = res["df_prophet"]
+                mape     = res.get("mape")
 
                 # Plot
                 fig = go.Figure()
@@ -532,6 +601,16 @@ def show_ml_page(df: pd.DataFrame, dataset_name: str):
                 )
                 st.plotly_chart(fig, use_container_width=True)
 
+                # V12: accuracy metric shown before the table
+                if mape is not None:
+                    acc_label = ("✅ High confidence" if mape < 10 else
+                                 "✅ Reasonable confidence" if mape < 20 else
+                                 "⚠️ Low confidence — historical fit is noisy")
+                    st.metric("Historical Fit (MAPE)", f"{mape:.1f}%",
+                               help="Average % error of the model on data it "
+                                    "already saw. Lower is better.")
+                    st.caption(acc_label)
+
                 # Forecast table
                 st.subheader("📋 Forecast Values")
                 fc_table = forecast[["ds","yhat","yhat_lower","yhat_upper"]]\
@@ -555,4 +634,5 @@ def show_ml_page(df: pd.DataFrame, dataset_name: str):
                     f"**Next month forecast:** {next_val:,.2f}\n\n"
                     f"Forecast based on {len(df_hist)} historical data points "
                     f"using Prophet model."
+                    + (f" Model's historical fit MAPE: {mape:.1f}%." if mape is not None else "")
                 )
