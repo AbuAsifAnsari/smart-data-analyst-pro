@@ -1,27 +1,26 @@
-# utils/ml_engine.py — V15
+# utils/ml_engine.py — V16
 # Machine Learning Engine
-# Regression, Classification, Clustering, Forecasting
+# Regression, Classification, Clustering, Forecasting, Anomaly Detection
 #
-# V15 CHANGELOG (from V14):
-#   - Target column dropdowns (Regression & Classification) no longer
-#     default to an identifier-like column (Row ID, Order ID, etc.) —
-#     they now default to the first "meaningful" column instead
-#   - If a user manually picks an identifier column as the target,
-#     a clear warning explains why that won't produce useful results
-#   - The old "continuous variable" warning (which only checked
-#     numeric columns) is replaced with a general high-cardinality
-#     warning that also catches categorical columns like "Order ID"
-#     (thousands of unique text values) being picked for Classification
-#   - Class imbalance check added for Classification: shows the class
-#     distribution and warns if one class dominates (>80%), since
-#     accuracy alone can be misleading in that case
+# V16 CHANGELOG (from V15):
+#   - Identifier detection is now smarter: besides the old "column has
+#     almost as many unique values as rows" check, it also flags
+#     columns by NAME (Postal Code, Customer ID, Phone Number, SKU,
+#     etc.) even when their cardinality is low — this catches things
+#     like "Postal Code" (~631 unique values out of 9994 rows) that
+#     the old uniqueness-only check missed
+#   - New ML task: 🚨 Anomaly Detection (Isolation Forest) — flags
+#     unusual records in the data. Useful for "unusual transactions",
+#     "quality control", "fraud-style" positioning in client demos.
 #
-# (V14 changes carried over: DBSCAN eps/min_samples tuning, identifier
-#  column exclusion from default features.
+# (V15 changes carried over: smart target defaults, identifier/high-
+#  cardinality target warnings, class imbalance check.
+#  V14 changes carried over: DBSCAN eps/min_samples tuning.
 #  V13 changes carried over: hyperparameter controls, cross-validation.
 #  V12 changes carried over: confusion matrix class names, model
-#  export, forecast MAPE, DBSCAN slider hidden when not needed.)
+#  export, forecast MAPE.)
 
+import re
 import pandas as pd
 import numpy as np
 import pickle
@@ -38,8 +37,14 @@ from sklearn.metrics import (mean_squared_error, r2_score,
 import warnings
 warnings.filterwarnings("ignore")
 
-# V15: max distinct classes we consider reasonable for classification
 MAX_REASONABLE_CLASSES = 20
+
+# V16: name tokens that strongly suggest a column is an identifier/code,
+# regardless of how many unique values it has
+_ID_NAME_KEYWORDS = {
+    "id", "code", "zip", "zipcode", "postcode", "pincode", "phone",
+    "number", "num", "no", "sku", "isbn", "uuid", "guid", "key"
+}
 
 
 # ══════════════════════════════════════════════════════════════
@@ -77,10 +82,20 @@ def _mape(y_true, y_pred):
     return np.mean(np.abs((y_true[mask] - y_pred[mask]) / y_true[mask])) * 100
 
 
+def _name_looks_like_id(col_name: str) -> bool:
+    """V16: tokenize the column name and check for identifier keywords
+    as whole tokens (not substrings), so 'Video' doesn't match 'id'
+    and 'Discount' doesn't match anything by accident."""
+    tokens = re.split(r"[^a-zA-Z0-9]+", col_name.lower())
+    return any(tok in _ID_NAME_KEYWORDS for tok in tokens if tok)
+
+
 def _detect_identifier_columns(df: pd.DataFrame, threshold: float = 0.95):
-    """Flag columns that look like unique identifiers (Row ID, Order ID,
-    Postal Code, etc.) — columns whose number of unique values is close
-    to the row count."""
+    """Flag columns that look like identifiers, either because:
+    (a) they have almost as many unique values as rows (Row ID, Order ID), or
+    (b) V16: their NAME suggests it's a code/identifier even with low
+        cardinality (Postal Code, Customer ID, Phone Number, SKU, etc.)
+    """
     n = len(df)
     if n == 0:
         return []
@@ -89,15 +104,19 @@ def _detect_identifier_columns(df: pd.DataFrame, threshold: float = 0.95):
         try:
             nunique = df[col].nunique()
         except TypeError:
-            continue
-        if nunique >= threshold * n and nunique > 1:
+            nunique = None
+        uniqueness_flag = (nunique is not None
+                            and nunique >= threshold * n
+                            and nunique > 1)
+        name_flag = _name_looks_like_id(col)
+        if uniqueness_flag or name_flag:
             id_cols.append(col)
     return id_cols
 
 
 def _first_non_id_index(options: list, id_cols: list) -> int:
-    """V15: pick the index of the first option that ISN'T an identifier
-    column, so target dropdowns don't default to Row ID / Order ID."""
+    """Pick the index of the first option that ISN'T an identifier
+    column, so target dropdowns don't default to Row ID / Postal Code."""
     for i, c in enumerate(options):
         if c not in id_cols:
             return i
@@ -321,6 +340,45 @@ def run_clustering(df: pd.DataFrame, features: list,
 
 
 # ══════════════════════════════════════════════════════════════
+#  ANOMALY DETECTION  (V16 — new)
+# ══════════════════════════════════════════════════════════════
+
+def run_anomaly_detection(df: pd.DataFrame, features: list,
+                          contamination: float = 0.05):
+    """Isolation Forest based outlier/anomaly detection."""
+    from sklearn.ensemble import IsolationForest
+    from sklearn.preprocessing import StandardScaler
+
+    df_clean = df[features].dropna()
+    df_enc, _ = _encode_df(df_clean)
+
+    scaler   = StandardScaler()
+    X_scaled = scaler.fit_transform(df_enc)
+
+    model = IsolationForest(
+        contamination=contamination,
+        random_state=42,
+        n_estimators=200,
+    )
+    labels = model.fit_predict(X_scaled)          # -1 = anomaly, 1 = normal
+    scores = model.decision_function(X_scaled)    # higher = more normal
+
+    df_result             = df_clean.copy()
+    df_result["Status"]   = np.where(labels == -1, "Anomaly", "Normal")
+    df_result["Anomaly Score"] = np.round(-scores, 4)  # flip so higher = more anomalous
+
+    anomaly_count = int((labels == -1).sum())
+    anomaly_pct   = anomaly_count / len(labels) * 100 if len(labels) else 0
+
+    return {
+        "df_result"    : df_result,
+        "anomaly_count": anomaly_count,
+        "anomaly_pct"  : anomaly_pct,
+        "features"     : features,
+    }
+
+
+# ══════════════════════════════════════════════════════════════
 #  FORECASTING
 # ══════════════════════════════════════════════════════════════
 
@@ -361,7 +419,7 @@ def run_forecasting(df: pd.DataFrame, date_col: str,
 # ══════════════════════════════════════════════════════════════
 
 def show_ml_page(df: pd.DataFrame, dataset_name: str):
-    """Main V15 ML page — call from app.py."""
+    """Main V16 ML page — call from app.py."""
     st.header("🤖 Machine Learning")
     st.caption(f"📂 {dataset_name} — {df.shape[0]} rows × {df.shape[1]} cols")
 
@@ -371,10 +429,11 @@ def show_ml_page(df: pd.DataFrame, dataset_name: str):
 
     id_cols = _detect_identifier_columns(df)
 
+    # V16: added Anomaly Detection as a 5th task
     ml_type = st.radio(
         "Select ML Task",
         ["📈 Regression", "🎯 Classification",
-         "🔵 Clustering", "📅 Forecasting"],
+         "🔵 Clustering", "🚨 Anomaly Detection", "📅 Forecasting"],
         horizontal=True
     )
     st.divider()
@@ -388,7 +447,6 @@ def show_ml_page(df: pd.DataFrame, dataset_name: str):
 
         col1, col2 = st.columns(2)
         with col1:
-            # V15: default to the first non-identifier numeric column
             target = st.selectbox(
                 "Target column (what to predict)",
                 num_cols,
@@ -400,13 +458,12 @@ def show_ml_page(df: pd.DataFrame, dataset_name: str):
                  "Random Forest", "Gradient Boosting"],
                 key="reg_model")
 
-        # V15: warn if the user picked an identifier column as target
         if target in id_cols:
             st.warning(
-                f"⚠️ '{target}' looks like a unique identifier (almost "
-                f"every row has a different value) rather than a "
-                f"meaningful quantity. Predicting it won't be useful — "
-                f"pick a column like Sales, Profit, or Quantity instead."
+                f"⚠️ '{target}' looks like a unique identifier or code "
+                f"rather than a meaningful quantity. Predicting it won't "
+                f"be useful — pick a column like Sales, Profit, or "
+                f"Quantity instead."
             )
 
         hyperparams = {}
@@ -439,7 +496,7 @@ def show_ml_page(df: pd.DataFrame, dataset_name: str):
         excluded_ids = [c for c in id_cols if c in feat_opts and c not in features]
         if excluded_ids:
             st.caption(
-                f"ℹ️ Not included by default (look like unique IDs): "
+                f"ℹ️ Not included by default (look like unique IDs/codes): "
                 f"{', '.join(excluded_ids)}. Add manually above if you "
                 f"really want to use them."
             )
@@ -528,7 +585,6 @@ def show_ml_page(df: pd.DataFrame, dataset_name: str):
 
         col1, col2 = st.columns(2)
         with col1:
-            # V15: default to the first non-identifier column
             target = st.selectbox(
                 "Target column (what to predict)",
                 target_opts,
@@ -540,16 +596,12 @@ def show_ml_page(df: pd.DataFrame, dataset_name: str):
                  "Random Forest", "Gradient Boosting"],
                 key="clf_model")
 
-        # V15: unified warning — identifier target OR too many classes
-        # (replaces the old numeric-only "continuous variable" check,
-        # so it also catches high-cardinality text columns like Order ID)
         target_nunique = df[target].nunique()
         if target in id_cols:
             st.warning(
-                f"⚠️ '{target}' looks like a unique identifier (almost "
-                f"every row has a different value) — it isn't a "
-                f"meaningful category to predict. Pick a column like "
-                f"Category or Segment instead."
+                f"⚠️ '{target}' looks like a unique identifier or code — "
+                f"it isn't a meaningful category to predict. Pick a "
+                f"column like Category or Segment instead."
             )
         elif target_nunique > MAX_REASONABLE_CLASSES:
             st.warning(
@@ -559,8 +611,6 @@ def show_ml_page(df: pd.DataFrame, dataset_name: str):
                 f"**Regression** instead if it's a numeric quantity."
             )
         else:
-            # V15: class imbalance check (only shown when the target
-            # is actually reasonable to classify)
             class_dist = df[target].value_counts()
             top_share  = class_dist.iloc[0] / class_dist.sum()
             with st.expander(f"📊 Class distribution for '{target}'"):
@@ -610,7 +660,7 @@ def show_ml_page(df: pd.DataFrame, dataset_name: str):
         excluded_ids = [c for c in id_cols if c in feat_opts and c not in features]
         if excluded_ids:
             st.caption(
-                f"ℹ️ Not included by default (look like unique IDs): "
+                f"ℹ️ Not included by default (look like unique IDs/codes): "
                 f"{', '.join(excluded_ids)}. Add manually above if you "
                 f"really want to use them."
             )
@@ -740,7 +790,7 @@ def show_ml_page(df: pd.DataFrame, dataset_name: str):
         excluded_ids = [c for c in id_cols if c in num_cols and c not in features]
         if excluded_ids:
             st.caption(
-                f"ℹ️ Not included by default (look like unique IDs): "
+                f"ℹ️ Not included by default (look like unique IDs/codes): "
                 f"{', '.join(excluded_ids)}. Add manually above if you "
                 f"really want to use them."
             )
@@ -789,6 +839,79 @@ def show_ml_page(df: pd.DataFrame, dataset_name: str):
                     f"**Clusters found:** {res['n_clusters']}\n\n"
                     "Each cluster represents a group of similar records. "
                     "Use the summary table to understand what makes each group unique."
+                )
+
+    # ══════════════════════════════════════════════════════════
+    # ANOMALY DETECTION  (V16 — new)
+    # ══════════════════════════════════════════════════════════
+    elif ml_type == "🚨 Anomaly Detection":
+        st.subheader("🚨 Anomaly Detection — Find Unusual Records")
+        st.caption("e.g. Unusual transactions, data entry errors, outlier orders")
+
+        default_feats = [c for c in num_cols if c not in id_cols][:4]
+        features = st.multiselect("Feature columns",
+                                   num_cols,
+                                   default=default_feats,
+                                   key="anom_feats")
+        excluded_ids = [c for c in id_cols if c in num_cols and c not in features]
+        if excluded_ids:
+            st.caption(
+                f"ℹ️ Not included by default (look like unique IDs/codes): "
+                f"{', '.join(excluded_ids)}. Add manually above if you "
+                f"really want to use them."
+            )
+
+        contamination = st.slider(
+            "Expected anomaly rate", 0.01, 0.30, 0.05, step=0.01,
+            key="anom_contamination",
+            help="Roughly what fraction of records you expect to be "
+                 "unusual. 0.05 = expect about 5% of rows to be anomalies."
+        )
+
+        if st.button("🚀 Detect Anomalies", type="primary",
+                     use_container_width=True, key="anom_run"):
+            if len(features) < 2:
+                st.warning("Please select at least 2 feature columns.")
+            else:
+                with st.spinner("Scanning for unusual records..."):
+                    res = run_anomaly_detection(df, features, contamination)
+
+                st.success(
+                    f"Found {res['anomaly_count']} unusual records "
+                    f"({res['anomaly_pct']:.1f}% of the data)."
+                )
+
+                fig = px.scatter(
+                    res["df_result"],
+                    x=features[0],
+                    y=features[1] if len(features) > 1 else features[0],
+                    color="Status",
+                    title=f"Anomalies — {features[0]} vs {features[1] if len(features) > 1 else features[0]}",
+                    color_discrete_map={"Normal": "#378ADD", "Anomaly": "#E24B4A"}
+                )
+                st.plotly_chart(_style(fig), use_container_width=True)
+
+                st.subheader("🚩 Flagged Anomalies")
+                anomalies_df = res["df_result"][
+                    res["df_result"]["Status"] == "Anomaly"
+                ].sort_values("Anomaly Score", ascending=False)
+                st.dataframe(anomalies_df, use_container_width=True)
+
+                csv = res["df_result"].to_csv(index=False).encode("utf-8")
+                st.download_button(
+                    "⬇️ Download Full Results (with anomaly flags)",
+                    data=csv,
+                    file_name="anomaly_detection_results.csv",
+                    mime="text/csv"
+                )
+
+                st.info(
+                    f"**Anomalies found:** {res['anomaly_count']} "
+                    f"({res['anomaly_pct']:.1f}% of {len(res['df_result'])} records)\n\n"
+                    "Records with a higher Anomaly Score are more unusual "
+                    "relative to the rest of the data. This doesn't "
+                    "automatically mean they're errors or fraud — review "
+                    "them manually to decide."
                 )
 
     # ══════════════════════════════════════════════════════════
