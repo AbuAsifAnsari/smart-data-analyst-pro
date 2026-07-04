@@ -1,21 +1,26 @@
-# utils/ml_engine.py — V14
+# utils/ml_engine.py — V15
 # Machine Learning Engine
 # Regression, Classification, Clustering, Forecasting
 #
-# V14 CHANGELOG (from V13):
-#   - DBSCAN now has tunable eps / min_samples sliders instead of
-#     hardcoded values (fixes the "everything becomes Noise" issue
-#     seen during testing with the Superstore dataset)
-#   - Identifier-like columns (Row ID, Order ID, Postal Code, etc. —
-#     anything with ~as many unique values as rows) are now auto-
-#     detected and excluded from default feature selections across
-#     Regression, Classification, and Clustering, with a note shown
-#     to the user. They can still be manually re-added if wanted.
+# V15 CHANGELOG (from V14):
+#   - Target column dropdowns (Regression & Classification) no longer
+#     default to an identifier-like column (Row ID, Order ID, etc.) —
+#     they now default to the first "meaningful" column instead
+#   - If a user manually picks an identifier column as the target,
+#     a clear warning explains why that won't produce useful results
+#   - The old "continuous variable" warning (which only checked
+#     numeric columns) is replaced with a general high-cardinality
+#     warning that also catches categorical columns like "Order ID"
+#     (thousands of unique text values) being picked for Classification
+#   - Class imbalance check added for Classification: shows the class
+#     distribution and warns if one class dominates (>80%), since
+#     accuracy alone can be misleading in that case
 #
-# (V13 changes carried over: hyperparameter controls, cross-validation.
-#  V12 changes carried over: confusion matrix class names, continuous-
-#  target warning, model export, forecast MAPE, DBSCAN slider hidden
-#  when not needed.)
+# (V14 changes carried over: DBSCAN eps/min_samples tuning, identifier
+#  column exclusion from default features.
+#  V13 changes carried over: hyperparameter controls, cross-validation.
+#  V12 changes carried over: confusion matrix class names, model
+#  export, forecast MAPE, DBSCAN slider hidden when not needed.)
 
 import pandas as pd
 import numpy as np
@@ -32,6 +37,9 @@ from sklearn.metrics import (mean_squared_error, r2_score,
                               confusion_matrix)
 import warnings
 warnings.filterwarnings("ignore")
+
+# V15: max distinct classes we consider reasonable for classification
+MAX_REASONABLE_CLASSES = 20
 
 
 # ══════════════════════════════════════════════════════════════
@@ -70,10 +78,9 @@ def _mape(y_true, y_pred):
 
 
 def _detect_identifier_columns(df: pd.DataFrame, threshold: float = 0.95):
-    """V14: Flag columns that look like unique identifiers (Row ID,
-    Order ID, Postal Code, etc.) — i.e. columns whose number of unique
-    values is close to the row count. These are almost never useful
-    as ML features/targets and just add noise or leak row identity."""
+    """Flag columns that look like unique identifiers (Row ID, Order ID,
+    Postal Code, etc.) — columns whose number of unique values is close
+    to the row count."""
     n = len(df)
     if n == 0:
         return []
@@ -86,6 +93,15 @@ def _detect_identifier_columns(df: pd.DataFrame, threshold: float = 0.95):
         if nunique >= threshold * n and nunique > 1:
             id_cols.append(col)
     return id_cols
+
+
+def _first_non_id_index(options: list, id_cols: list) -> int:
+    """V15: pick the index of the first option that ISN'T an identifier
+    column, so target dropdowns don't default to Row ID / Order ID."""
+    for i, c in enumerate(options):
+        if c not in id_cols:
+            return i
+    return 0
 
 
 # ══════════════════════════════════════════════════════════════
@@ -280,7 +296,7 @@ def run_clustering(df: pd.DataFrame, features: list,
     if model_name == "K-Means":
         model  = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
         labels = model.fit_predict(X_scaled)
-    else:  # DBSCAN — V14: eps/min_samples now configurable from the UI
+    else:  # DBSCAN
         model  = DBSCAN(eps=eps, min_samples=min_samples)
         labels = model.fit_predict(X_scaled)
         n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
@@ -345,7 +361,7 @@ def run_forecasting(df: pd.DataFrame, date_col: str,
 # ══════════════════════════════════════════════════════════════
 
 def show_ml_page(df: pd.DataFrame, dataset_name: str):
-    """Main V14 ML page — call from app.py."""
+    """Main V15 ML page — call from app.py."""
     st.header("🤖 Machine Learning")
     st.caption(f"📂 {dataset_name} — {df.shape[0]} rows × {df.shape[1]} cols")
 
@@ -353,10 +369,8 @@ def show_ml_page(df: pd.DataFrame, dataset_name: str):
     cat_cols  = df.select_dtypes(include="object").columns.tolist()
     all_cols  = df.columns.tolist()
 
-    # V14: detect identifier-like columns once, reuse everywhere below
     id_cols = _detect_identifier_columns(df)
 
-    # ── ML Type selector ──────────────────────────────────────
     ml_type = st.radio(
         "Select ML Task",
         ["📈 Regression", "🎯 Classification",
@@ -374,13 +388,26 @@ def show_ml_page(df: pd.DataFrame, dataset_name: str):
 
         col1, col2 = st.columns(2)
         with col1:
-            target   = st.selectbox("Target column (what to predict)",
-                                     num_cols, key="reg_target")
+            # V15: default to the first non-identifier numeric column
+            target = st.selectbox(
+                "Target column (what to predict)",
+                num_cols,
+                index=_first_non_id_index(num_cols, id_cols),
+                key="reg_target")
         with col2:
             model_name = st.selectbox("Model",
                 ["Linear Regression", "Ridge Regression",
                  "Random Forest", "Gradient Boosting"],
                 key="reg_model")
+
+        # V15: warn if the user picked an identifier column as target
+        if target in id_cols:
+            st.warning(
+                f"⚠️ '{target}' looks like a unique identifier (almost "
+                f"every row has a different value) rather than a "
+                f"meaningful quantity. Predicting it won't be useful — "
+                f"pick a column like Sales, Profit, or Quantity instead."
+            )
 
         hyperparams = {}
         with st.expander("⚙️ Advanced settings (hyperparameters)"):
@@ -403,7 +430,6 @@ def show_ml_page(df: pd.DataFrame, dataset_name: str):
             else:
                 st.caption("Linear Regression has no tunable hyperparameters.")
 
-        # V14: exclude identifier-like columns from default features
         feat_opts     = [c for c in all_cols if c != target]
         default_feats = [c for c in feat_opts if c not in id_cols][:4]
         features  = st.multiselect("Feature columns (inputs)",
@@ -498,24 +524,60 @@ def show_ml_page(df: pd.DataFrame, dataset_name: str):
         st.subheader("🎯 Classification — Predict a Category")
         st.caption("e.g. Predict product category, customer segment")
 
+        target_opts = cat_cols + num_cols
+
         col1, col2 = st.columns(2)
         with col1:
-            target = st.selectbox("Target column (what to predict)",
-                                   cat_cols + num_cols, key="clf_target")
+            # V15: default to the first non-identifier column
+            target = st.selectbox(
+                "Target column (what to predict)",
+                target_opts,
+                index=_first_non_id_index(target_opts, id_cols),
+                key="clf_target")
         with col2:
             model_name = st.selectbox("Model",
                 ["Logistic Regression", "Decision Tree",
                  "Random Forest", "Gradient Boosting"],
                 key="clf_model")
 
-        if target in num_cols and df[target].nunique() > 15:
+        # V15: unified warning — identifier target OR too many classes
+        # (replaces the old numeric-only "continuous variable" check,
+        # so it also catches high-cardinality text columns like Order ID)
+        target_nunique = df[target].nunique()
+        if target in id_cols:
             st.warning(
-                f"⚠️ '{target}' looks like a continuous variable "
-                f"({df[target].nunique()} unique values) rather than a "
-                f"category. Classification may give meaningless results — "
-                f"consider using **Regression** instead, or pick a column "
-                f"with fewer distinct values."
+                f"⚠️ '{target}' looks like a unique identifier (almost "
+                f"every row has a different value) — it isn't a "
+                f"meaningful category to predict. Pick a column like "
+                f"Category or Segment instead."
             )
+        elif target_nunique > MAX_REASONABLE_CLASSES:
+            st.warning(
+                f"⚠️ '{target}' has {target_nunique} unique values — too "
+                f"many distinct categories for classification to work "
+                f"well. Consider a column with fewer categories, or use "
+                f"**Regression** instead if it's a numeric quantity."
+            )
+        else:
+            # V15: class imbalance check (only shown when the target
+            # is actually reasonable to classify)
+            class_dist = df[target].value_counts()
+            top_share  = class_dist.iloc[0] / class_dist.sum()
+            with st.expander(f"📊 Class distribution for '{target}'"):
+                fig_dist = px.bar(
+                    x=class_dist.index.astype(str), y=class_dist.values,
+                    labels={"x": target, "y": "Count"},
+                    color_discrete_sequence=["#378ADD"]
+                )
+                st.plotly_chart(_style(fig_dist), use_container_width=True)
+            if top_share > 0.8:
+                st.warning(
+                    f"⚠️ Class imbalance detected — '{class_dist.index[0]}' "
+                    f"makes up {top_share*100:.0f}% of the data. A model "
+                    f"could get high accuracy just by always guessing that "
+                    f"class. Check precision/recall per class, not just "
+                    f"overall accuracy."
+                )
 
         hyperparams = {}
         with st.expander("⚙️ Advanced settings (hyperparameters)"):
@@ -539,7 +601,6 @@ def show_ml_page(df: pd.DataFrame, dataset_name: str):
                         "Learning rate", 0.01, 0.3, 0.1, step=0.01,
                         key="clf_lr")
 
-        # V14: exclude identifier-like columns from default features
         feat_opts     = [c for c in num_cols if c != target]
         default_feats = [c for c in feat_opts if c not in id_cols][:4]
         features  = st.multiselect("Feature columns (numeric only)",
@@ -645,12 +706,11 @@ def show_ml_page(df: pd.DataFrame, dataset_name: str):
             if model_name == "K-Means":
                 n_clusters = st.slider("Number of clusters", 2, 8, 3,
                                         key="clust_n")
-                eps, min_samples = 0.5, 5  # unused for K-Means
+                eps, min_samples = 0.5, 5
             else:
-                n_clusters = 3  # unused, DBSCAN infers cluster count itself
+                n_clusters = 3
                 st.caption("DBSCAN finds the number of clusters automatically.")
 
-        # V14: DBSCAN tuning controls (shown only when DBSCAN is selected)
         if model_name == "DBSCAN":
             c1, c2 = st.columns(2)
             with c1:
@@ -672,7 +732,6 @@ def show_ml_page(df: pd.DataFrame, dataset_name: str):
                 "try increasing eps first."
             )
 
-        # V14: exclude identifier-like columns from default features
         default_feats = [c for c in num_cols if c not in id_cols][:3]
         features = st.multiselect("Feature columns",
                                    num_cols,
