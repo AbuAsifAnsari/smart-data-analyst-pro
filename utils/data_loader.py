@@ -1,14 +1,44 @@
 import pandas as pd
 
+
 def load_file(uploaded_file):
     filename = uploaded_file.name
+
     if filename.endswith(".csv"):
-        df = pd.read_csv(uploaded_file)
+        # Try encodings in order — most CSVs are UTF-8, but files exported
+        # from Excel (like the common "Superstore" dataset) are often
+        # Windows-1252 / Latin-1, which breaks pd.read_csv with a
+        # UnicodeDecodeError if we don't fall back.
+        encodings_to_try = ["utf-8", "latin1", "cp1252"]
+        df = None
+        last_error = None
+
+        for enc in encodings_to_try:
+            try:
+                uploaded_file.seek(0)  # reset pointer before each attempt
+                df = pd.read_csv(uploaded_file, encoding=enc)
+                break
+            except (UnicodeDecodeError, UnicodeError) as e:
+                last_error = e
+                continue
+            except Exception as e:
+                # Non-encoding errors (bad delimiter, corrupt file, etc.)
+                return None, f"❌ Could not read CSV file: {e}"
+
+        if df is None:
+            return None, f"❌ Could not read file — unsupported encoding: {last_error}"
+
     elif filename.endswith((".xlsx", ".xls")):
-        df = pd.read_excel(uploaded_file)
+        try:
+            df = pd.read_excel(uploaded_file)
+        except Exception as e:
+            return None, f"❌ Could not read Excel file: {e}"
+
     else:
         return None, "❌ Sirf CSV ya Excel file upload karein."
+
     return df, None
+
 
 def get_data_summary(df):
     basic = f"""
